@@ -76,9 +76,38 @@ Get conversation details.
 | `page` | default: 1 |
 | `limit` | default: 50 |
 
-**Returns:**
-- Conversation metadata
-- Messages (paginated, newest first)
+**Response (example):**
+```json
+{
+  "id": "conv_1",
+  "channel": "whatsapp",
+  "participantId": "user-123",
+  "status": "open",
+  "unreadCount": 0,
+  "lastMessageAt": "2025-01-01T10:05:00Z",
+  "messages": [
+    {
+      "id": "msg_2",
+      "direction": "OUTBOUND",
+      "text": "Merhaba!",
+      "status": "SENT",
+      "createdAt": "2025-01-01T10:05:00Z"
+    },
+    {
+      "id": "msg_1",
+      "direction": "INBOUND",
+      "text": "Hello",
+      "status": "RECEIVED",
+      "createdAt": "2025-01-01T10:00:00Z"
+    }
+  ],
+  "meta": { "page": 1, "limit": 50 }
+}
+```
+
+**Notes:**
+- Messages are paginated, newest first
+- `direction`: `INBOUND` (from participant) or `OUTBOUND` (to participant)
 
 #### `POST /conversations/:id/read`
 
@@ -116,8 +145,8 @@ Receives inbound message events from the mock provider.
 - `eventId` is mandatory and globally unique per provider.
 - Persist webhook events in PostgreSQL.
 - **Idempotency:** If the same `eventId` is received again, it must be ignored safely.
-- Create or update the conversation.
-- Insert inbound message.
+- **Conversation lookup:** Find or create conversation by `(channel, from)` pair. The `from` field represents the `participantId`.
+- Insert inbound message with `direction: INBOUND`.
 - Increment `unreadCount`.
 - All steps must run inside a **single database transaction**.
 
@@ -141,13 +170,14 @@ Send a text message to a participant via the mock provider.
 ```
 
 **Rules:**
-- `clientMessageId` is optional but must be idempotent if provided.
-- Create message record first with status `PENDING`.
+- **Conversation lookup:** Find or create conversation by `(channel, to)` pair. The `to` field represents the `participantId`.
+- `clientMessageId` is optional. If provided, it enables idempotency. If not provided, each request creates a new message (no duplicate protection).
+- Create message record first with status `PENDING` and `direction: OUTBOUND`.
 - Attempt to send via mock provider.
 - On success → mark `SENT` and store `providerMessageId`.
 - On failure → mark `FAILED` with error details.
 
-**Idempotent behavior:**
+**Idempotent behavior (when `clientMessageId` is provided):**
 
 If the same `(channel, clientMessageId)` is sent again:
 - Do not create a new message.
@@ -155,7 +185,22 @@ If the same `(channel, clientMessageId)` is sent again:
 
 #### `GET /messages/:id`
 
-Returns message metadata and status: `PENDING` | `SENT` | `FAILED`
+Returns message metadata and status.
+
+**Response:**
+```json
+{
+  "id": "msg_123",
+  "conversationId": "conv_1",
+  "direction": "OUTBOUND",
+  "text": "Merhaba!",
+  "status": "SENT",
+  "providerMessageId": "msg_xxx",
+  "createdAt": "2025-01-01T10:00:00Z"
+}
+```
+
+**Possible status values:** `PENDING` | `SENT` | `FAILED`
 
 ---
 
@@ -199,13 +244,15 @@ docker-compose up
 - Duplicate send requests must return the same message record.
 
 ##### 3) Retry & Outbox Strategy
-- Messages in `FAILED` state may be retried.
+- A **background worker** must automatically retry messages in `FAILED` state.
+- Store `retryCount` and `lastError` on each message.
+- Max retry attempts: 3 (configurable).
 - **Retryable errors:**
   - `429`
   - `5xx`
   - network timeouts
 - **Non-retryable:**
-  - other `4xx`
+  - other `4xx` (do not retry, mark as permanently failed)
 
 ##### 4) Safe Retry Claiming (Concurrency)
 - Retry worker must atomically claim messages to retry.
@@ -277,7 +324,7 @@ docker-compose up
 
 # Mock Meta Provider
 
-WhatsApp/Instagram benzeri Meta API'sini simüle eden Express.js servisi.
+WhatsApp/Instagram benzeri Meta API'sini simüle eden NestJS servisi.
 
 **Runs at:** `http://localhost:4000`
 
@@ -349,6 +396,24 @@ Inbound mesaj simülasyonu - webhook'u NestJS API'ye gönderir.
   "simulation": {
     "duplicate": true,
     "outOfOrder": false
+  }
+}
+```
+
+---
+
+### `GET /config`
+Mevcut simülasyon ayarlarını görüntüle.
+
+**Response:**
+```json
+{
+  "success": true,
+  "config": {
+    "failureRate": 0.3,
+    "duplicateRate": 0.2,
+    "outOfOrderRate": 0.15,
+    "delayMaxMs": 2000
   }
 }
 ```
